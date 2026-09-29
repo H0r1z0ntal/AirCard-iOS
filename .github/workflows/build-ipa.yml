@@ -1,0 +1,140 @@
+name: Build AirCard-iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build-ipa.yml"
+      - "ios-app/**"
+      - "rust-core/**"
+      - "AirliftFFI.xcframework/**"
+      - "AirCard-iOS.xcodeproj/**"
+      - "project.yml"
+      - "build-ios.sh"
+      - "build-ipa.sh"
+
+permissions:
+  contents: read
+
+jobs:
+  build-ipa:
+    # AirliftFFI is arm64-only, so use an Apple Silicon runner.
+    # macOS 26 images currently provide Xcode 26.x and the arm64 Rust toolchain.
+    runs-on: macos-26
+
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -d "$DEVELOPER_DIR" ]]; then
+            echo "::error::Expected Xcode was not found at $DEVELOPER_DIR"
+            ls -1 /Applications | grep -i 'Xcode' || true
+            exit 1
+          fi
+
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install XcodeGen
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install xcodegen
+          xcodegen version
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+          rustc --version
+          cargo --version
+          rustup target add \
+            aarch64-apple-ios \
+            aarch64-apple-ios-sim
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-core/target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('rust-core/Cargo.lock', 'rust-core/Cargo.toml', 'rust-core/vendor/**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-
+
+      - name: Build the Rust iOS framework
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./build-ios.sh
+
+      - name: Regenerate the Xcode project
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodegen generate
+          test -f AirCard-iOS.xcodeproj/project.pbxproj
+
+      - name: Build unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./build-ipa.sh Release
+
+      - name: Validate IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IPA="build/AirCard-iOS.ipa"
+          test -s "$IPA"
+
+          rm -rf /tmp/aircard-ipa-check
+          mkdir -p /tmp/aircard-ipa-check
+          ditto -x -k "$IPA" /tmp/aircard-ipa-check
+
+          APP="/tmp/aircard-ipa-check/Payload/AirCard-iOS.app"
+          EXEC="$APP/AirCard-iOS"
+
+          test -d "$APP"
+          test -x "$EXEC"
+
+          echo "==> IPA contents"
+          find /tmp/aircard-ipa-check/Payload -maxdepth 2 -print
+
+          echo "==> Mach-O architecture"
+          file "$EXEC"
+
+          echo "==> Bundle identifier"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist"
+
+          echo "==> IPA size"
+          ls -lh "$IPA"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: AirCard-iOS-unsigned-ipa
+          path: build/AirCard-iOS.ipa
+          if-no-files-found: error
+          retention-days: 14
